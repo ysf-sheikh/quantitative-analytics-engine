@@ -64,9 +64,3 @@ Ensure you have Python 3.9+ installed. Install the necessary dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
-### Runing the Demonstration Pipeline
-To execute a full simulation loop across both desks (loading sample data, pricing forward contracts, validating risk guardrails, evaluating borrowers, and calculating optimal FICO credit score brackets), run the master driver script:
-```bash
-python main.py
-```
