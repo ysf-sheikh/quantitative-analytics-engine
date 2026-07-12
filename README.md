@@ -1,6 +1,6 @@
 # Quantitative Finance & Credit Risk Analytics Engine
 
-A production-grade Python portfolio demonstrating quantitative methods in asset pricing, derivative contract valuation, credit default classification, and algorithmic risk bucket optimization. 
+A Python portfolio demonstrating quantitative methods developed for the JPMorgan Chase job simulation, spanning asset pricing, derivative valuation, credit default classification, and algorithmic risk bucket optimization.
 
 ---
 
