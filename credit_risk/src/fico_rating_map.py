@@ -2,230 +2,712 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from pathlib import Path
 
-def create_fico_rating_map(df, num_buckets=5):
+
+class FICORatingQuantizer:
     """
-    Creates FICO rating buckets by maximizing log-likelihood
-    of observed defaults using dynamic programming.
+    Optimizes FICO score segmentation using Dynamic Programming.
+
+    Features:
+        - Maximum binomial log-likelihood segmentation
+        - Minimum bucket population constraints
+        - Monotonic PD enforcement
+        - Bayesian PD smoothing
+        - Weight of Evidence (WoE)
+        - Information Value (IV)
+        - Credit rating assignment
+        - Visualization
+
+    Notes:
+        Monotonicity is enforced through iterative adjacent-bucket
+        merging after unconstrained DP optimization. This does not
+        guarantee globally optimal constrained segmentation.
     """
 
-    fico_min = 300
-    fico_max = 850
+    def __init__(
+        self,
+        num_buckets=5,
+        min_bucket_size=100,
+        monotonic=True,
+        smoothing=True,
+        alpha=1,
+        beta=1
+    ):
 
-    # Aggregate borrowers by FICO score
-    score_data = (
-        df.groupby("fico_score")["default"]
-        .agg(["count", "sum"])
-        .reindex(range(fico_min, fico_max + 1), fill_value=0)
-    )
+        if not isinstance(num_buckets, int) or num_buckets < 1:
+            raise ValueError("num_buckets must be a positive integer.")
 
-    counts = score_data["count"].values
-    defaults = score_data["sum"].values
+        if not isinstance(min_bucket_size, int) or min_bucket_size < 1:
+            raise ValueError("min_bucket_size must be a positive integer.")
 
-    score_range = len(counts)
+        if alpha <= 0 or beta <= 0:
+            raise ValueError("Alpha and beta must be positive.")
 
+        self.num_buckets = num_buckets
+        self.min_bucket_size = min_bucket_size
+        self.monotonic = monotonic
+        self.smoothing = smoothing
+        self.alpha = alpha
+        self.beta = beta
 
-    # Calculate log-likelihood for every possible bucket range
-    bucket_cost = np.full(
-        (score_range, score_range),
-        -np.inf
-    )
+        self.rating_map = None
+        self.boundaries = None
+        self.is_fitted = False
 
-    for start in range(score_range):
-        total_count = 0
-        total_defaults = 0
+    # ---------------------------------------------------------
+    # 1. INPUT VALIDATION
+    # ---------------------------------------------------------
 
-        for end in range(start, score_range):
+    @staticmethod
+    def _validate_data(df):
 
-            total_count += counts[end]
-            total_defaults += defaults[end]
+        required_columns = {"fico_score", "default"}
 
-            if total_count > 0:
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError("Input must be a pandas DataFrame.")
 
-                probability_default = (
-                    total_defaults / total_count
+        if not required_columns.issubset(df.columns):
+            raise ValueError(
+                f"Dataset must contain columns: {required_columns}"
+            )
+
+        if df.empty:
+            raise ValueError("Dataset cannot be empty.")
+
+        data = df[["fico_score", "default"]].copy()
+
+        if data.isnull().any().any():
+            raise ValueError("Missing values detected.")
+
+        if not pd.api.types.is_numeric_dtype(data["fico_score"]):
+            raise ValueError("FICO scores must be numeric.")
+
+        if not np.isfinite(data["fico_score"]).all():
+            raise ValueError("FICO scores must be finite.")
+
+        if not data["fico_score"].between(300, 850).all():
+            raise ValueError("FICO scores must be between 300 and 850.")
+
+        if not (data["fico_score"] % 1 == 0).all():
+            raise ValueError("FICO scores must be integers.")
+
+        if not data["default"].isin([0, 1]).all():
+            raise ValueError("Default labels must contain only 0 and 1.")
+
+        data["fico_score"] = data["fico_score"].astype(int)
+        data["default"] = data["default"].astype(int)
+
+        return data
+
+    # ---------------------------------------------------------
+    # 2. BINOMIAL LOG-LIKELIHOOD
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _calculate_log_likelihood(
+        total_count,
+        total_defaults
+    ):
+
+        if total_count <= 0:
+            return -np.inf
+
+        good = total_count - total_defaults
+
+        likelihood = 0.0
+
+        if total_defaults > 0:
+
+            likelihood += (
+                total_defaults
+                * np.log(total_defaults / total_count)
+            )
+
+        if good > 0:
+
+            likelihood += (
+                good
+                * np.log(good / total_count)
+            )
+
+        return likelihood
+
+    # ---------------------------------------------------------
+    # 3. DYNAMIC PROGRAMMING OPTIMIZATION
+    # ---------------------------------------------------------
+
+    def _optimize_boundaries(self, counts, defaults):
+
+        n = len(counts)
+        buckets = self.num_buckets
+
+        if np.count_nonzero(counts) < buckets:
+            raise ValueError(
+                "Not enough distinct populated FICO scores "
+                "for the requested number of buckets."
+            )
+
+        prefix_counts = np.concatenate([
+            [0],
+            np.cumsum(counts)
+        ])
+
+        prefix_defaults = np.concatenate([
+            [0],
+            np.cumsum(defaults)
+        ])
+
+        dp = np.full(
+            (buckets + 1, n + 1),
+            -np.inf
+        )
+
+        split_points = np.full(
+            (buckets + 1, n + 1),
+            -1,
+            dtype=int
+        )
+
+        dp[0, 0] = 0.0
+
+        for b in range(1, buckets + 1):
+
+            for end in range(b, n + 1):
+
+                for split in range(b - 1, end):
+
+                    total_count = (
+                        prefix_counts[end]
+                        - prefix_counts[split]
+                    )
+
+                    if total_count < self.min_bucket_size:
+                        continue
+
+                    total_defaults = (
+                        prefix_defaults[end]
+                        - prefix_defaults[split]
+                    )
+
+                    bucket_likelihood = (
+                        self._calculate_log_likelihood(
+                            total_count,
+                            total_defaults
+                        )
+                    )
+
+                    previous_score = dp[b - 1, split]
+
+                    if not np.isfinite(previous_score):
+                        continue
+
+                    candidate = (
+                        previous_score
+                        + bucket_likelihood
+                    )
+
+                    if candidate > dp[b, end]:
+
+                        dp[b, end] = candidate
+
+                        split_points[b, end] = split
+
+        if not np.isfinite(dp[buckets, n]):
+            raise ValueError(
+                "Unable to create the requested number of buckets "
+                "under the minimum bucket size constraint."
+            )
+
+        # Recover optimal segmentation.
+
+        segments = []
+
+        end = n
+
+        for b in range(buckets, 0, -1):
+
+            split = split_points[b, end]
+
+            if split < 0:
+                raise RuntimeError(
+                    "Failed to reconstruct optimal boundaries."
                 )
 
-                # Avoid log(0) errors
-                probability_default = np.clip(
-                    probability_default,
-                    1e-10,
-                    1 - 1e-10
+            segments.append((split, end))
+
+            end = split
+
+        segments.reverse()
+
+        return segments
+
+    # ---------------------------------------------------------
+    # 4. MONOTONICITY ENFORCEMENT
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _enforce_monotonicity(segments):
+
+        """
+        Merge adjacent buckets whenever PD increases with FICO.
+
+        Expected relationship:
+
+            PD(lower FICO) >= PD(higher FICO)
+
+        This is an iterative merging heuristic, not a globally
+        optimal monotonic segmentation algorithm.
+        """
+
+        segments = [segment.copy() for segment in segments]
+
+        changed = True
+
+        while changed:
+
+            changed = False
+
+            i = 0
+
+            while i < len(segments) - 1:
+
+                current = segments[i]
+                following = segments[i + 1]
+
+                current_pd = (
+                    current["defaults"] / current["borrowers"]
                 )
 
-                bucket_cost[start, end] = (
-                    total_defaults * np.log(probability_default)
-                    +
-                    (total_count - total_defaults)
-                    * np.log(1 - probability_default)
+                following_pd = (
+                    following["defaults"] / following["borrowers"]
                 )
 
+                if current_pd < following_pd:
 
-    # Dynamic programming tables
-    dp = np.full(
-        (num_buckets + 1, score_range),
-        -np.inf
-    )
+                    merged = {
+                        "start": current["start"],
+                        "end": following["end"],
+                        "borrowers": (
+                            current["borrowers"]
+                            + following["borrowers"]
+                        ),
+                        "defaults": (
+                            current["defaults"]
+                            + following["defaults"]
+                        )
+                    }
 
-    split_points = np.zeros(
-        (num_buckets + 1, score_range),
-        dtype=int
-    )
+                    segments[i] = merged
 
+                    segments.pop(i + 1)
 
-    # Base case: one bucket covering scores from start to end
-    for end in range(score_range):
-        dp[1][end] = bucket_cost[0][end]
+                    changed = True
 
+                    if i > 0:
+                        i -= 1
 
-    # Build optimal bucket combinations
-    for bucket in range(2, num_buckets + 1):
+                else:
 
-        for end in range(bucket - 1, score_range):
+                    i += 1
 
-            for split in range(bucket - 2, end):
+        return segments
 
-                value = (
-                    dp[bucket - 1][split]
-                    +
-                    bucket_cost[split + 1][end]
-                )
+    # ---------------------------------------------------------
+    # 5. FIT MODEL
+    # ---------------------------------------------------------
 
-                if value > dp[bucket][end]:
-                    dp[bucket][end] = value
-                    split_points[bucket][end] = split
+    def fit(self, df):
 
+        data = self._validate_data(df)
 
-    # Recover optimal boundaries
-    boundaries = []
-
-    current = score_range - 1
-
-    for bucket in range(num_buckets, 1, -1):
-
-        current = split_points[bucket][current]
-
-        boundaries.append(current)
-
-
-    boundaries = sorted(boundaries)
-
-    fico_boundaries = [
-        fico_min + boundary
-        for boundary in boundaries
-    ]
-
-
-    # Create bucket summary
-    bucket_summary = []
-
-    for i in range(num_buckets):
-
-        lower = (
-            fico_min
-            if i == 0
-            else fico_boundaries[i - 1] + 1
+        scores = np.sort(
+            data["fico_score"].unique()
         )
 
-        upper = (
-            fico_max
-            if i == num_buckets - 1
-            else fico_boundaries[i]
+        aggregated = (
+            data.groupby("fico_score")["default"]
+            .agg(["count", "sum"])
+            .reindex(scores, fill_value=0)
         )
 
+        counts = aggregated["count"].to_numpy(dtype=float)
 
-        # Avoid overlapping ranges
-        if i == num_buckets - 1:
-            bucket_data = df[
-                (df["fico_score"] >= lower)
-                &
-                (df["fico_score"] <= upper)
-            ]
-        else:
-            bucket_data = df[
-                (df["fico_score"] >= lower)
-                &
-                (df["fico_score"] < upper)
-            ]
+        defaults = aggregated["sum"].to_numpy(dtype=float)
 
+        # Dynamic Programming optimization.
 
-        borrowers = len(bucket_data)
-
-        defaults_in_bucket = (
-            bucket_data["default"].sum()
+        optimal_segments = self._optimize_boundaries(
+            counts,
+            defaults
         )
 
-        pd_rate = (
-            defaults_in_bucket / borrowers
-            if borrowers > 0
-            else 0
-        )
+        segments = []
 
+        for start, end in optimal_segments:
 
-        bucket_summary.append(
-            {
-                "FICO Range": f"{lower}-{upper}",
-                "Borrowers": borrowers,
-                "Defaults": defaults_in_bucket,
-                "PD": pd_rate
-            }
-        )
+            segments.append({
+                "start": int(start),
+                "end": int(end),
+                "borrowers": int(counts[start:end].sum()),
+                "defaults": int(defaults[start:end].sum())
+            })
 
+        # Optional monotonic enforcement.
 
-    # Sort buckets so lower rating means lower default risk
-    bucket_summary = sorted(
-        bucket_summary,
-        key=lambda x: x["PD"]
-    )
+        if self.monotonic:
 
+            segments = self._enforce_monotonicity(
+                segments
+            )
 
-    # Assign final ratings
-    for rating, bucket in enumerate(bucket_summary, 1):
-        bucket["Rating"] = rating
+        self.segments_ = segments
+        self.scores_ = scores
 
+        self.global_pd_ = data["default"].mean()
 
-    rating_map = pd.DataFrame(bucket_summary)
+        self.data_ = data
 
-    return rating_map
+        self.rating_map = self._build_rating_map()
 
-
-
-# Load mortgage borrower data
-df = pd.read_csv("loan_data.csv")
-
-
-# Create FICO rating categories
-rating_map = create_fico_rating_map(
-    df,
-    num_buckets=5
-)
-
-
-print("\nFICO Rating Map")
-print("----------------")
-print(
-    rating_map[
-        [
-            "Rating",
-            "FICO Range",
-            "Borrowers",
-            "Defaults",
-            "PD"
+        self.boundaries = [
+            segment["end"]
+            for segment in segments[:-1]
         ]
-    ].to_string(index=False)
-)
+
+        self.is_fitted = True
+
+        return self
+
+    # ---------------------------------------------------------
+    # 6. BUILD RATING MAP
+    # ---------------------------------------------------------
+
+    def _build_rating_map(self):
+
+        total_good = (
+            len(self.data_)
+            - self.data_["default"].sum()
+        )
+
+        total_bad = self.data_["default"].sum()
+
+        rows = []
+
+        for i, segment in enumerate(self.segments_):
+
+            borrowers = segment["borrowers"]
+
+            defaults = segment["defaults"]
+
+            good = borrowers - defaults
+
+            raw_pd = defaults / borrowers
+
+            if self.smoothing:
+
+                smoothed_pd = (
+                    defaults + self.alpha
+                ) / (
+                    borrowers + self.alpha + self.beta
+                )
+
+            else:
+
+                smoothed_pd = raw_pd
+
+            good_distribution = (
+                good / total_good
+                if total_good > 0
+                else 0
+            )
+
+            bad_distribution = (
+                defaults / total_bad
+                if total_bad > 0
+                else 0
+            )
+
+            # Smoothed WoE calculations.
+
+            epsilon = 1e-10
+
+            smoothed_good = (
+                good_distribution + epsilon
+            )
+
+            smoothed_bad = (
+                bad_distribution + epsilon
+            )
+
+            woe = np.log(
+                smoothed_good / smoothed_bad
+            )
+
+            iv_contribution = (
+                smoothed_good - smoothed_bad
+            ) * woe
+
+            lower = (
+                300
+                if i == 0
+                else self.scores_[segment["start"]]
+            )
+
+            upper = (
+                850
+                if i == len(self.segments_) - 1
+                else self.scores_[segment["end"]]
+            )
+
+            rows.append({
+
+                "FICO Lower": int(lower),
+
+                "FICO Upper": int(upper),
+
+                "FICO Range": f"{lower}-{upper}",
+
+                "Borrowers": borrowers,
+
+                "Defaults": defaults,
+
+                "Good": good,
+
+                "Raw PD": raw_pd,
+
+                "PD": smoothed_pd,
+
+                "WoE": woe,
+
+                "IV Contribution": iv_contribution
+
+            })
+
+        rating_map = pd.DataFrame(rows)
+
+        # Assign rating 1 to the lowest-risk bucket.
+
+        rating_map = rating_map.sort_values(
+            "PD",
+            ascending=True
+        ).reset_index(drop=True)
+
+        rating_map["Rating"] = (
+            np.arange(len(rating_map)) + 1
+        )
+
+        rating_map = rating_map[
+            [
+                "Rating",
+                "FICO Lower",
+                "FICO Upper",
+                "FICO Range",
+                "Borrowers",
+                "Defaults",
+                "Good",
+                "Raw PD",
+                "PD",
+                "WoE",
+                "IV Contribution"
+            ]
+        ]
+
+        return rating_map
+
+    # ---------------------------------------------------------
+    # 7. PREDICT RATINGS
+    # ---------------------------------------------------------
+
+    def predict(self, fico_scores):
+
+        if not self.is_fitted:
+            raise RuntimeError("Fit the quantizer before prediction.")
+
+        scores = np.asarray(fico_scores)
+
+        if not np.issubdtype(scores.dtype, np.number):
+            raise ValueError("FICO scores must be numeric.")
+
+        if not np.isfinite(scores).all():
+            raise ValueError("FICO scores must be finite.")
+
+        if not np.equal(scores, np.floor(scores)).all():
+            raise ValueError("FICO scores must be integers.")
+
+        if not ((scores >= 300) & (scores <= 850)).all():
+            raise ValueError("FICO scores must be between 300 and 850.")
+
+        ratings = np.zeros(len(scores), dtype=int)
+
+        for _, row in self.rating_map.iterrows():
+
+            mask = (
+                (scores >= row["FICO Lower"])
+                &
+                (scores <= row["FICO Upper"])
+            )
+
+            ratings[mask] = int(row["Rating"])
+
+        return ratings
+
+    # ---------------------------------------------------------
+    # 8. INFORMATION VALUE
+    # ---------------------------------------------------------
+
+    def calculate_iv(self):
+
+        if not self.is_fitted:
+            raise RuntimeError("Fit the quantizer first.")
+
+        return self.rating_map["IV Contribution"].sum()
+
+    # ---------------------------------------------------------
+    # 9. VISUALIZATION
+    # ---------------------------------------------------------
+
+    def plot_rating_map(self):
+
+        if not self.is_fitted:
+            raise RuntimeError("Fit the quantizer first.")
+
+        rating_map = self.rating_map.sort_values(
+            "FICO Lower"
+        )
+
+        plt.figure(figsize=(10, 6))
+
+        plt.bar(
+            rating_map["FICO Range"],
+            rating_map["PD"]
+        )
+
+        plt.xlabel("FICO Score Range")
+
+        plt.ylabel("Probability of Default")
+
+        plt.title(
+            "Optimized FICO Credit Risk Segmentation"
+        )
+
+        plt.xticks(rotation=30)
+
+        plt.grid(
+            axis="y",
+            alpha=0.3
+        )
+
+        plt.tight_layout()
+
+        plt.show()
+
+    # ---------------------------------------------------------
+    # 10. SUMMARY
+    # ---------------------------------------------------------
+
+    def summary(self):
+
+        if not self.is_fitted:
+            raise RuntimeError("Fit the quantizer first.")
+
+        print("\nFICO CREDIT RATING SUMMARY")
+
+        print("=" * 75)
+
+        print(
+            self.rating_map.to_string(
+                index=False,
+                formatters={
+                    "Raw PD": "{:.4%}".format,
+                    "PD": "{:.4%}".format,
+                    "WoE": "{:.4f}".format,
+                    "IV Contribution": "{:.4f}".format
+                }
+            )
+        )
+
+        print("\nModel Statistics")
+
+        print("-" * 35)
+
+        print(f"Original requested buckets: {self.num_buckets}")
+
+        print(f"Final buckets: {len(self.rating_map)}")
+
+        print(f"Global default rate: {self.global_pd_:.4%}")
+
+        print(f"Information Value: {self.calculate_iv():.4f}")
+
+        print("=" * 75)
+
+        return self.rating_map
 
 
-# Visualize default probability by rating bucket
-plt.figure(figsize=(8, 5))
+# =============================================================
+# BACKWARD-COMPATIBLE FUNCTION
+# =============================================================
 
-plt.bar(
-    rating_map["Rating"].astype(str),
-    rating_map["PD"]
-)
+def create_fico_rating_map(
+    df,
+    num_buckets=5,
+    min_bucket_size=100,
+    monotonic=True,
+    smoothing=True
+):
 
-plt.xlabel("FICO Rating (1 = Lowest Risk)")
-plt.ylabel("Probability of Default")
-plt.title("Mortgage Default Risk by FICO Rating Bucket")
+    """
+    Backward-compatible interface for FICO rating map creation.
 
-plt.show()
+    Returns:
+        pandas.DataFrame: Optimized credit rating map.
+    """
+
+    quantizer = FICORatingQuantizer(
+
+        num_buckets=num_buckets,
+
+        min_bucket_size=min_bucket_size,
+
+        monotonic=monotonic,
+
+        smoothing=smoothing
+
+    )
+
+    quantizer.fit(df)
+
+    return quantizer.rating_map
+
+
+# =============================================================
+# EXECUTION
+# =============================================================
+
+if __name__ == "__main__":
+
+    data_path = Path(__file__).resolve().parent / "loan_data.csv"
+
+    df = pd.read_csv(data_path)
+
+    quantizer = FICORatingQuantizer(
+
+        num_buckets=5,
+
+        min_bucket_size=100,
+
+        monotonic=True,
+
+        smoothing=True
+
+    )
+
+    quantizer.fit(df)
+
+    quantizer.summary()
+
+    print("\nTotal Information Value:")
+
+    print(round(quantizer.calculate_iv(), 4))
+
+    quantizer.plot_rating_map()
